@@ -1,0 +1,425 @@
+# Reusable workflow: CI for any Lumina W product repo.
+#
+# Each repo keeps only a thin .github/workflows/ci.yml that calls this workflow
+# and passes what is specific to it: its runner label, toolchain and commands.
+# Nothing here names a repo. Usage and inputs: README.md.
+#
+# Every job runs on the org's self-hosted build runners, picked with
+# [self-hosted, build, <repo-label>]. Which jobs run depends on the event that
+# triggered the caller; the rest are skipped:
+#
+#   job                  pull_request        push                schedule, dispatch
+#   lint-build-test      yes                 -                   -
+#   gitleaks             yes                 -                   -
+#   dependency-audit     base dev/stg/main   dev, stg, main      yes
+#   codeql               base dev/stg/main   dev, stg, main      yes
+#   pr-title             yes                 -                   -
+#   validate-pr-base     yes                 -                   -
+#   commit-lint          -                   any branch          -
+#
+# Not here yet: docker-build (image build check, no push). It waits for the
+# kaniko design and will be added later as its own job, separate from these.
+
+name: CI (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      repo-label:
+        description: Runner label of the calling repo; the runner is [self-hosted, build, <repo-label>]
+        type: string
+        required: true
+      toolchain:
+        description: "npm | pnpm | python | none"
+        type: string
+        required: true
+      node-version:
+        type: string
+        default: ""
+      node-version-file:
+        description: e.g. .nvmrc (used when node-version is empty)
+        type: string
+        default: ""
+      python-version:
+        type: string
+        default: ""
+      python-cache-path:
+        description: Requirements file used as pip cache key; empty disables the pip cache
+        type: string
+        default: ""
+      env-vars:
+        description: KEY=value per line, exported for install, checks and audit (no secrets)
+        type: string
+        default: ""
+      install-command:
+        description: e.g. "npm ci", "pnpm install --frozen-lockfile". Empty skips the step
+        type: string
+        default: ""
+      format-command:
+        description: e.g. "npm run format:check". Empty skips the step
+        type: string
+        default: ""
+      lint-command:
+        description: Empty skips the step
+        type: string
+        default: ""
+      typecheck-command:
+        description: Empty skips the step
+        type: string
+        default: ""
+      test-command:
+        description: Empty skips the step
+        type: string
+        default: ""
+      build-command:
+        description: Empty skips the step
+        type: string
+        default: ""
+      audit-command:
+        description: Dependency audit, e.g. "npm audit --audit-level=high". Empty skips the job
+        type: string
+        default: ""
+      audit-blocking:
+        description: false keeps the audit informational (the job stays green on findings)
+        type: boolean
+        default: false
+      codeql-languages:
+        description: JSON array of CodeQL languages, e.g. '["javascript-typescript"]'. Empty skips the job
+        type: string
+        default: ""
+      commitlint-config:
+        description: Config for pr-title and commit-lint. Empty skips both jobs
+        type: string
+        default: .commitlintrc.json
+      gitleaks:
+        description: Run the gitleaks secret scan on pull requests
+        type: boolean
+        default: true
+    secrets:
+      GITLEAKS_LICENSE:
+        description: Required by gitleaks-action for org-owned repos
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  lint-build-test:
+    name: Lint, build & test
+    if: github.event_name == 'pull_request'
+    runs-on: [self-hosted, build, "${{ inputs.repo-label }}"]
+    timeout-minutes: 15
+    steps:
+      - name: Check toolchain input
+        if: ${{ !contains(fromJSON('["npm", "pnpm", "python", "none"]'), inputs.toolchain) }}
+        env:
+          TOOLCHAIN: ${{ inputs.toolchain }}
+        run: |
+          echo "::error::Unknown toolchain '$TOOLCHAIN' (expected npm, pnpm, python or none)."
+          exit 1
+
+      - uses: actions/checkout@v7
+
+      - name: Export environment
+        if: inputs.env-vars != ''
+        env:
+          ENV_VARS: ${{ inputs.env-vars }}
+        run: |
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            if [[ ! "$line" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
+              echo "::error::env-vars line is not KEY=value: $line"
+              exit 1
+            fi
+            echo "$line" >> "$GITHUB_ENV"
+          done <<< "$ENV_VARS"
+
+      - uses: pnpm/action-setup@v6.1.0
+        if: inputs.toolchain == 'pnpm'
+
+      - uses: actions/setup-node@v7
+        if: inputs.toolchain == 'npm' || inputs.toolchain == 'pnpm'
+        with:
+          node-version: ${{ inputs.node-version }}
+          node-version-file: ${{ inputs.node-version-file }}
+          cache: ${{ inputs.toolchain }}
+
+      - uses: actions/setup-python@v7
+        if: inputs.toolchain == 'python'
+        with:
+          python-version: ${{ inputs.python-version }}
+          cache: ${{ inputs.python-cache-path != '' && 'pip' || '' }}
+          cache-dependency-path: ${{ inputs.python-cache-path }}
+
+      - name: Install dependencies
+        if: inputs.install-command != ''
+        run: ${{ inputs.install-command }}
+
+      - name: Format check
+        if: inputs.format-command != ''
+        run: ${{ inputs.format-command }}
+
+      - name: Lint
+        if: inputs.lint-command != ''
+        run: ${{ inputs.lint-command }}
+
+      - name: Type check
+        if: inputs.typecheck-command != ''
+        run: ${{ inputs.typecheck-command }}
+
+      - name: Test
+        if: inputs.test-command != ''
+        run: ${{ inputs.test-command }}
+
+      - name: Build
+        if: inputs.build-command != ''
+        run: ${{ inputs.build-command }}
+
+  gitleaks:
+    name: Secret scan (gitleaks)
+    if: github.event_name == 'pull_request' && inputs.gitleaks
+    runs-on: [self-hosted, build, "${{ inputs.repo-label }}"]
+    timeout-minutes: 10
+
+    # gitleaks-action lists the PR's commits to scan only the diff; without
+    # this the default GITHUB_TOKEN has no pull-requests scope and the call
+    # 403s with "Resource not accessible by integration".
+    permissions:
+      contents: read
+      pull-requests: read
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # gitleaks-action requires a license for org-owned repos. Dependabot
+      # runs read from the Dependabot secret store, not the Actions one, so
+      # GITLEAKS_LICENSE has to exist in BOTH or every Dependabot PR fails
+      # this job with "missing gitleaks license".
+      - uses: gitleaks/gitleaks-action@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+
+  dependency-audit:
+    name: Dependency audit
+    if: >-
+      inputs.audit-command != '' && (
+        (github.event_name == 'pull_request' && contains(fromJSON('["dev", "stg", "main"]'), github.base_ref)) ||
+        (github.event_name == 'push' && contains(fromJSON('["refs/heads/dev", "refs/heads/stg", "refs/heads/main"]'), github.ref)) ||
+        github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+      )
+    runs-on: [self-hosted, build, "${{ inputs.repo-label }}"]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Export environment
+        if: inputs.env-vars != ''
+        env:
+          ENV_VARS: ${{ inputs.env-vars }}
+        run: |
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            if [[ ! "$line" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
+              echo "::error::env-vars line is not KEY=value: $line"
+              exit 1
+            fi
+            echo "$line" >> "$GITHUB_ENV"
+          done <<< "$ENV_VARS"
+
+      - uses: pnpm/action-setup@v6.1.0
+        if: inputs.toolchain == 'pnpm'
+
+      # No dependency cache or install here: npm audit and pnpm audit read the
+      # lockfile, and a Python audit installs its own tool in audit-command.
+      - uses: actions/setup-node@v7
+        if: inputs.toolchain == 'npm' || inputs.toolchain == 'pnpm'
+        with:
+          node-version: ${{ inputs.node-version }}
+          node-version-file: ${{ inputs.node-version-file }}
+
+      - uses: actions/setup-python@v7
+        if: inputs.toolchain == 'python'
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      # Informational unless audit-blocking is true: continue-on-error keeps
+      # the report in the logs without failing the check.
+      - name: Audit dependencies
+        continue-on-error: ${{ !inputs.audit-blocking }}
+        run: ${{ inputs.audit-command }}
+
+  codeql:
+    name: CodeQL
+    if: >-
+      inputs.codeql-languages != '' && (
+        (github.event_name == 'pull_request' && contains(fromJSON('["dev", "stg", "main"]'), github.base_ref)) ||
+        (github.event_name == 'push' && contains(fromJSON('["refs/heads/dev", "refs/heads/stg", "refs/heads/main"]'), github.ref)) ||
+        github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+      )
+    runs-on: [self-hosted, build, "${{ inputs.repo-label }}"]
+    timeout-minutes: 30
+    # Informational: findings show up under Security -> Code scanning and
+    # never block a PR.
+    continue-on-error: true
+
+    permissions:
+      # security-events: write is the only one needed to publish results to
+      # Code scanning; the other two are requested by the action itself.
+      security-events: write
+      actions: read
+      contents: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        language: ${{ fromJSON(inputs.codeql-languages) }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+
+      # Step-level continue-on-error is what keeps the CHECK RUN green, not just
+      # the workflow run. While Code Security is disabled on a private repo the
+      # SARIF upload fails with "Code Security must be enabled", so this step
+      # would otherwise turn red on every PR.
+      - name: Perform CodeQL Analysis
+        continue-on-error: true
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:${{ matrix.language }}"
+
+  # PRs are squash-merged, so the PR title becomes the commit that lands on the
+  # base branch. It is checked with the same config as every pushed commit
+  # (commit-lint below), so the rules live in one place.
+  pr-title:
+    name: PR title (Conventional Commits)
+    if: github.event_name == 'pull_request' && inputs.commitlint-config != ''
+    runs-on: [self-hosted, build, "${{ inputs.repo-label }}"]
+    timeout-minutes: 5
+    env:
+      # Passed through the environment, never interpolated into the script,
+      # so a crafted title cannot inject shell.
+      PR_TITLE: ${{ github.event.pull_request.title }}
+      COMMITLINT_CONFIG: ${{ inputs.commitlint-config }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+
+      # commitlint resolves `extends` from the config file's own directory, so
+      # the config is linted from a scratch dir holding the packages.
+      - name: Install commitlint
+        run: |
+          dir="$RUNNER_TEMP/commitlint"
+          mkdir -p "$dir"
+          cp "$COMMITLINT_CONFIG" "$dir/"
+          cd "$dir"
+          npm init -y >/dev/null
+          npm install --no-audit --no-fund --silent \
+            @commitlint/cli@21 @commitlint/config-conventional@21
+
+      - name: Lint the PR title
+        working-directory: ${{ runner.temp }}/commitlint
+        run: printf '%s' "$PR_TITLE" | npx --no-install commitlint
+
+  validate-pr-base:
+    name: PR base must follow dev -> stg -> main
+    if: github.event_name == 'pull_request'
+    runs-on: [self-hosted, build, "${{ inputs.repo-label }}"]
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Check base/head branch pair
+        env:
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          # True when HEAD's tree is identical to origin/$1's tree: a
+          # dedicated conflict-resolution branch that carries $1's content
+          # verbatim, just with extra merge-commit parentage so a future
+          # promotion doesn't re-hit the same conflict. Named differently
+          # from 'dev'/'stg' only because a promotion branch can't be pushed
+          # to the protected branch itself to resolve a merge conflict.
+          content_matches() {
+            git fetch origin "$1" --depth=1 -q
+            git diff --quiet "origin/$1" "$HEAD_SHA" --
+          }
+
+          if [[ "$BASE_REF" == "stg" && "$HEAD_REF" != "dev" ]] && ! content_matches dev; then
+            echo "::error::PR targets base 'stg' but head is '$HEAD_REF' (expected 'dev', or a branch whose content matches dev exactly for conflict resolution). This repo's flow is dev -> stg -> main."
+            exit 1
+          fi
+          if [[ "$BASE_REF" == "main" && "$HEAD_REF" != "stg" ]] && ! content_matches stg; then
+            echo "::error::PR targets base 'main' but head is '$HEAD_REF' (expected 'stg', or a branch whose content matches stg exactly for conflict resolution). This repo's flow is dev -> stg -> main."
+            exit 1
+          fi
+          if [[ "$BASE_REF" != "dev" && "$BASE_REF" != "stg" && "$BASE_REF" != "main" ]]; then
+            echo "::error::PR base '$BASE_REF' is not an allowed target (expected one of: dev, stg, main)."
+            exit 1
+          fi
+          echo "OK: head '$HEAD_REF' -> base '$BASE_REF' is a valid PR direction."
+
+  # Lints only the commits a push introduced, the same range the previous
+  # wagoid/commitlint-github-action used: before..after, so older history is
+  # never re-checked. A brand-new branch has no `before`, and then only the
+  # commits listed in the push payload are linted (also the fallback when a
+  # force push left `before` unreachable). The commitlint CLI replaces that
+  # action because it is a Docker container action, which would tie this job
+  # to a Docker daemon on the runner.
+  commit-lint:
+    name: Conventional Commits
+    if: github.event_name == 'push' && inputs.commitlint-config != ''
+    runs-on: [self-hosted, build, "${{ inputs.repo-label }}"]
+    timeout-minutes: 5
+    env:
+      COMMITLINT_CONFIG: ${{ inputs.commitlint-config }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+
+      - name: Install commitlint
+        run: |
+          dir="$RUNNER_TEMP/commitlint"
+          mkdir -p "$dir"
+          cp "$COMMITLINT_CONFIG" "$dir/"
+          cd "$dir"
+          npm init -y >/dev/null
+          npm install --no-audit --no-fund --silent \
+            @commitlint/cli@21 @commitlint/config-conventional@21
+
+      - name: Lint pushed commits
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [[ "$BEFORE" =~ ^0*$ ]] || ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            commits=$(node -e 'for (const c of require(process.env.GITHUB_EVENT_PATH).commits || []) console.log(c.id)')
+          else
+            commits=$(git rev-list "$BEFORE..$GITHUB_SHA")
+          fi
+          status=0
+          for sha in $commits; do
+            echo "::group::$sha $(git log -1 --format=%s "$sha")"
+            git log -1 --format=%B "$sha" \
+              | (cd "$RUNNER_TEMP/commitlint" && npx --no-install commitlint) || status=1
+            echo "::endgroup::"
+          done
+          exit "$status"
